@@ -1,0 +1,48 @@
+{
+  "annotations": {
+    "title": "Create or update file"
+  },
+  "description": "Create or update a single file in a GitHub repository. If updating, you must provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.",
+  "inputSchema": {
+    "type": "object",
+    "required": [
+      "owner",
+      "repo",
+      "path",
+      "content",
+      "message",
+      "branch"
+    ],
+    "properties": {
+      "branch": {
+        "type": "string",
+        "description": "Branch to create/update the file in"
+      },
+      "content": {
+        "type": "string",
+        "description": "Content of the file"
+      },
+      "message": {
+        "type": "string",
+        "description": "Commit message"
+      },
+      "owner": {
+        "type": "string",
+        "description": "Repository owner (username or organization)"
+      },
+      "path": {
+        "type": "string",
+        "description": "Path where to create/update the file"
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name"
+      },
+      "sha": {
+        "type": "string",
+        "description": "Required if updating an existing file. The blob SHA of the file being replaced."
+      }
+    }
+  },
+  "name": "create_or_update_file"
+}

@@ -1,0 +1,29 @@
+{
+  "annotations": {
+    "title": "Request Copilot review"
+  },
+  "description": "Request a GitHub Copilot code review for a pull request. Use this for automated feedback on pull requests, usually before requesting a human reviewer.",
+  "inputSchema": {
+    "type": "object",
+    "required": [
+      "owner",
+      "repo",
+      "pullNumber"
+    ],
+    "properties": {
+      "owner": {
+        "type": "string",
+        "description": "Repository owner"
+      },
+      "pullNumber": {
+        "type": "number",
+        "description": "Pull request number"
+      },
+      "repo": {
+        "type": "string",
+        "description": "Repository name"
+      }
+    }
+  },
+  "name": "request_copilot_review"
+}
