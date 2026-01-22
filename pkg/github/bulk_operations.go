@@ -148,6 +148,7 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 		// Validate all files upfront
 		var files []fileEntry
 		var totalSize int64
+		seenPaths := make(map[string]int) // Track file paths and their indices for deduplication
 
 		for i, file := range filesObj {
 			fileMap, ok := file.(map[string]interface{})
@@ -165,11 +166,20 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 				return utils.NewToolResultError(fmt.Sprintf("file at index %d must have content", i)), nil, nil
 			}
 
+			// Check for duplicate paths
+			if firstIndex, exists := seenPaths[path]; exists {
+				return utils.NewToolResultError(fmt.Sprintf(
+					"duplicate file path '%s' found at indices %d and %d - each file path must be unique",
+					path, firstIndex, i,
+				)), nil, nil
+			}
+			seenPaths[path] = i
+
 			fileSize := int64(len(content))
 			if fileSize > MaxFileSizeBytes {
 				return utils.NewToolResultError(fmt.Sprintf(
-					"file '%s' size (%d bytes) exceeds maximum of %d bytes",
-					path, fileSize, MaxFileSizeBytes,
+					"file '%s' size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB)",
+					path, fileSize, float64(fileSize)/(1024*1024), MaxFileSizeBytes, float64(MaxFileSizeBytes)/(1024*1024),
 				)), nil, nil
 			}
 
@@ -182,25 +192,48 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 			return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 		}
 
-		// Calculate chunks
-		totalFiles := len(files)
-		totalChunks := (totalFiles + chunkSize - 1) / chunkSize
+		// Create size-aware chunks
+		// Leave 20% margin below the 100MB limit to account for API overhead
+		maxChunkBytes := int64(float64(MaxTotalPushSizeBytes) * 0.8)
+		var chunks [][]fileEntry
+
+		var currentChunk []fileEntry
+		var currentChunkSize int64
+		var currentChunkFileCount int
+
+		for _, file := range files {
+			fileSize := int64(len(file.content))
+
+			// Check if adding this file would exceed limits
+			wouldExceedSize := currentChunkSize+fileSize > maxChunkBytes
+			wouldExceedCount := currentChunkFileCount >= chunkSize
+
+			// Start a new chunk if we'd exceed either limit (and current chunk is not empty)
+			if len(currentChunk) > 0 && (wouldExceedSize || wouldExceedCount) {
+				chunks = append(chunks, currentChunk)
+				currentChunk = []fileEntry{}
+				currentChunkSize = 0
+				currentChunkFileCount = 0
+			}
+
+			currentChunk = append(currentChunk, file)
+			currentChunkSize += fileSize
+			currentChunkFileCount++
+		}
+
+		// Add the last chunk if it has files
+		if len(currentChunk) > 0 {
+			chunks = append(chunks, currentChunk)
+		}
 
 		result := PushFilesChunkedResult{
-			TotalFiles:  totalFiles,
-			TotalChunks: totalChunks,
-			Chunks:      make([]ChunkResult, 0, totalChunks),
+			TotalFiles:  len(files),
+			TotalChunks: len(chunks),
+			Chunks:      make([]ChunkResult, 0, len(chunks)),
 		}
 
 		// Process each chunk
-		for chunkIdx := 0; chunkIdx < totalChunks; chunkIdx++ {
-			startIdx := chunkIdx * chunkSize
-			endIdx := startIdx + chunkSize
-			if endIdx > totalFiles {
-				endIdx = totalFiles
-			}
-
-			chunkFiles := files[startIdx:endIdx]
+		for chunkIdx, chunkFiles := range chunks {
 			chunkResult := ChunkResult{
 				ChunkIndex:   chunkIdx + 1,
 				FilesInChunk: len(chunkFiles),
@@ -213,8 +246,8 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 
 			// Generate commit message for this chunk
 			chunkMessage := message
-			if totalChunks > 1 {
-				chunkMessage = fmt.Sprintf("%s [chunk %d/%d]", message, chunkIdx+1, totalChunks)
+			if result.TotalChunks > 1 {
+				chunkMessage = fmt.Sprintf("%s [chunk %d/%d]", message, chunkIdx+1, result.TotalChunks)
 			}
 
 			// Push this chunk
@@ -256,17 +289,29 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 
 // pushChunk pushes a single chunk of files to the repository
 func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch string, files []fileEntry, message string) (string, error) {
+	// Validate chunk size before attempting to push
+	var chunkSize int64
+	for _, file := range files {
+		chunkSize += int64(len(file.content))
+	}
+	if chunkSize > MaxTotalPushSizeBytes {
+		return "", fmt.Errorf("chunk size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB) - this chunk contains %d files totaling too much data. Reduce chunk_size parameter or split large files",
+			chunkSize, float64(chunkSize)/(1024*1024), MaxTotalPushSizeBytes, float64(MaxTotalPushSizeBytes)/(1024*1024), len(files))
+	}
+
 	// Get the reference for the branch
 	ref, resp, err := client.Git.GetRef(ctx, owner, repo, "refs/heads/"+branch)
 	if err != nil {
-		return "", fmt.Errorf("failed to get branch reference: %w", err)
+		_, apiErr := ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to get branch reference", resp, err)
+		return "", apiErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	// Get the commit object that the branch points to
 	baseCommit, resp, err := client.Git.GetCommit(ctx, owner, repo, *ref.Object.SHA)
 	if err != nil {
-		return "", fmt.Errorf("failed to get base commit: %w", err)
+		_, apiErr := ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to get base commit", resp, err)
+		return "", apiErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -284,7 +329,8 @@ func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch s
 	// Create a new tree
 	newTree, resp, err := client.Git.CreateTree(ctx, owner, repo, *baseCommit.Tree.SHA, entries)
 	if err != nil {
-		return "", fmt.Errorf("failed to create tree: %w", err)
+		_, apiErr := ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to create tree", resp, err)
+		return "", apiErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -296,7 +342,8 @@ func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch s
 	}
 	newCommit, resp, err := client.Git.CreateCommit(ctx, owner, repo, commit, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create commit: %w", err)
+		_, apiErr := ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to create commit", resp, err)
+		return "", apiErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -306,7 +353,8 @@ func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch s
 		Force: github.Ptr(false),
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to update reference: %w", err)
+		_, apiErr := ghErrors.NewGitHubAPIErrorToCtx(ctx, "failed to update reference", resp, err)
+		return "", apiErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 
