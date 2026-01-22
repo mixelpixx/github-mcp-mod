@@ -34,11 +34,9 @@ type PushFilesChunkedResult struct {
 	FullySuccessful  bool          `json:"fully_successful"`
 }
 
-// fileEntry represents a file to be pushed
-type fileEntry struct {
-	path    string
-	content string
-}
+// Deprecated: use FileEntry from validation.go instead
+// Kept for backward compatibility with pushChunk signature
+type fileEntry = FileEntry
 
 // PushFilesChunked creates a tool to push multiple files in chunks, creating multiple commits.
 // This is designed for large file operations that exceed the limits of push_files.
@@ -145,46 +143,17 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 			return utils.NewToolResultError("files array cannot be empty"), nil, nil
 		}
 
-		// Validate all files upfront
-		var files []fileEntry
-		var totalSize int64
-		seenPaths := make(map[string]int) // Track file paths and their indices for deduplication
+		// Validate all files using shared validation logic
+		validationResult, files, err := ValidateFiles(filesObj)
+		if err != nil {
+			return utils.NewToolResultError(err.Error()), nil, nil
+		}
 
-		for i, file := range filesObj {
-			fileMap, ok := file.(map[string]interface{})
-			if !ok {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must be an object with path and content", i)), nil, nil
+		// Check for oversized files
+		for _, path := range validationResult.OversizedFiles {
+			if result, err := ValidateFileSize(path, validationResult.LargestFileSize); result != nil || err != nil {
+				return result, nil, nil
 			}
-
-			path, ok := fileMap["path"].(string)
-			if !ok || path == "" {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must have a path", i)), nil, nil
-			}
-
-			content, ok := fileMap["content"].(string)
-			if !ok {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must have content", i)), nil, nil
-			}
-
-			// Check for duplicate paths
-			if firstIndex, exists := seenPaths[path]; exists {
-				return utils.NewToolResultError(fmt.Sprintf(
-					"duplicate file path '%s' found at indices %d and %d - each file path must be unique",
-					path, firstIndex, i,
-				)), nil, nil
-			}
-			seenPaths[path] = i
-
-			fileSize := int64(len(content))
-			if fileSize > MaxFileSizeBytes {
-				return utils.NewToolResultError(fmt.Sprintf(
-					"file '%s' size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB)",
-					path, fileSize, float64(fileSize)/(1024*1024), MaxFileSizeBytes, float64(MaxFileSizeBytes)/(1024*1024),
-				)), nil, nil
-			}
-
-			files = append(files, fileEntry{path: path, content: content})
-			totalSize += fileSize
 		}
 
 		client, err := getClient(ctx)
@@ -192,17 +161,16 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 			return nil, nil, fmt.Errorf("failed to get GitHub client: %w", err)
 		}
 
-		// Create size-aware chunks
-		// Leave 20% margin below the 100MB limit to account for API overhead
-		maxChunkBytes := int64(float64(MaxTotalPushSizeBytes) * 0.8)
-		var chunks [][]fileEntry
+		// Create size-aware chunks using safety margin
+		maxChunkBytes := GetMaxChunkSize()
+		var chunks [][]FileEntry
 
 		var currentChunk []fileEntry
 		var currentChunkSize int64
 		var currentChunkFileCount int
 
 		for _, file := range files {
-			fileSize := int64(len(file.content))
+			fileSize := int64(len(file.Content))
 
 			// Check if adding this file would exceed limits
 			wouldExceedSize := currentChunkSize+fileSize > maxChunkBytes
@@ -241,7 +209,7 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 			}
 
 			for _, f := range chunkFiles {
-				chunkResult.Files = append(chunkResult.Files, f.path)
+				chunkResult.Files = append(chunkResult.Files, f.Path)
 			}
 
 			// Generate commit message for this chunk
@@ -288,15 +256,10 @@ func PushFilesChunked(getClient GetClientFn, t translations.TranslationHelperFun
 }
 
 // pushChunk pushes a single chunk of files to the repository
-func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch string, files []fileEntry, message string) (string, error) {
+func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch string, files []FileEntry, message string) (string, error) {
 	// Validate chunk size before attempting to push
-	var chunkSize int64
-	for _, file := range files {
-		chunkSize += int64(len(file.content))
-	}
-	if chunkSize > MaxTotalPushSizeBytes {
-		return "", fmt.Errorf("chunk size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB) - this chunk contains %d files totaling too much data. Reduce chunk_size parameter or split large files",
-			chunkSize, float64(chunkSize)/(1024*1024), MaxTotalPushSizeBytes, float64(MaxTotalPushSizeBytes)/(1024*1024), len(files))
+	if err := ValidateChunkSize(files); err != nil {
+		return "", err
 	}
 
 	// Get the reference for the branch
@@ -319,10 +282,10 @@ func pushChunk(ctx context.Context, client *github.Client, owner, repo, branch s
 	var entries []*github.TreeEntry
 	for _, file := range files {
 		entries = append(entries, &github.TreeEntry{
-			Path:    github.Ptr(file.path),
+			Path:    github.Ptr(file.Path),
 			Mode:    github.Ptr("100644"),
 			Type:    github.Ptr("blob"),
-			Content: github.Ptr(file.content),
+			Content: github.Ptr(file.Content),
 		})
 	}
 

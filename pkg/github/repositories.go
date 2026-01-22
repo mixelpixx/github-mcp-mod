@@ -1237,55 +1237,26 @@ func PushFiles(getClient GetClientFn, t translations.TranslationHelperFunc) (mcp
 		}
 
 		// Validate file count limit
-		if len(filesObj) > MaxFilesPerPush {
-			return utils.NewToolResultError(fmt.Sprintf(
-				"too many files: %d exceeds maximum of %d per push_files call. Use push_files_chunked for larger batches or make multiple calls",
-				len(filesObj), MaxFilesPerPush,
-			)), nil, nil
+		if result, err := ValidateFileCount(len(filesObj), MaxFilesPerPush); result != nil || err != nil {
+			return result, nil, nil
 		}
 
-		// Pre-validate files and calculate total size
-		var totalSize int64
-		seenPaths := make(map[string]int) // Track file paths for deduplication
-
-		for i, file := range filesObj {
-			fileMap, ok := file.(map[string]interface{})
-			if !ok {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must be an object with path and content", i)), nil, nil
-			}
-
-			path, ok := fileMap["path"].(string)
-			if !ok || path == "" {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must have a non-empty path", i)), nil, nil
-			}
-
-			// Check for duplicate paths
-			if firstIndex, exists := seenPaths[path]; exists {
-				return utils.NewToolResultError(fmt.Sprintf(
-					"duplicate file path '%s' found at indices %d and %d - each file path must be unique",
-					path, firstIndex, i,
-				)), nil, nil
-			}
-			seenPaths[path] = i
-
-			content, ok := fileMap["content"].(string)
-			if !ok {
-				return utils.NewToolResultError(fmt.Sprintf("file at index %d must have content", i)), nil, nil
-			}
-			fileSize := int64(len(content))
-			if fileSize > MaxFileSizeBytes {
-				return utils.NewToolResultError(fmt.Sprintf(
-					"file '%s' size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB)",
-					path, fileSize, float64(fileSize)/(1024*1024), MaxFileSizeBytes, float64(MaxFileSizeBytes)/(1024*1024),
-				)), nil, nil
-			}
-			totalSize += fileSize
+		// Validate files using shared validation logic
+		validationResult, files, err := ValidateFiles(filesObj)
+		if err != nil {
+			return utils.NewToolResultError(err.Error()), nil, nil
 		}
-		if totalSize > MaxTotalPushSizeBytes {
-			return utils.NewToolResultError(fmt.Sprintf(
-				"total content size (%d bytes, %.2f MB) exceeds maximum of %d bytes (%.0f MB)",
-				totalSize, float64(totalSize)/(1024*1024), MaxTotalPushSizeBytes, float64(MaxTotalPushSizeBytes)/(1024*1024),
-			)), nil, nil
+
+		// Check for oversized files
+		for _, path := range validationResult.OversizedFiles {
+			if result, err := ValidateFileSize(path, validationResult.LargestFileSize); result != nil || err != nil {
+				return result, nil, nil
+			}
+		}
+
+		// Validate total size
+		if result, err := ValidateTotalSize(validationResult.TotalSize); result != nil || err != nil {
+			return result, nil, nil
 		}
 
 		client, err := getClient(ctx)
@@ -1317,29 +1288,12 @@ func PushFiles(getClient GetClientFn, t translations.TranslationHelperFunc) (mcp
 
 		// Create tree entries for all files
 		var entries []*github.TreeEntry
-
-		for _, file := range filesObj {
-			fileMap, ok := file.(map[string]interface{})
-			if !ok {
-				return utils.NewToolResultError("each file must be an object with path and content"), nil, nil
-			}
-
-			path, ok := fileMap["path"].(string)
-			if !ok || path == "" {
-				return utils.NewToolResultError("each file must have a path"), nil, nil
-			}
-
-			content, ok := fileMap["content"].(string)
-			if !ok {
-				return utils.NewToolResultError("each file must have content"), nil, nil
-			}
-
-			// Create a tree entry for the file
+		for _, file := range files {
 			entries = append(entries, &github.TreeEntry{
-				Path:    github.Ptr(path),
+				Path:    github.Ptr(file.Path),
 				Mode:    github.Ptr("100644"), // Regular file mode
 				Type:    github.Ptr("blob"),
-				Content: github.Ptr(content),
+				Content: github.Ptr(file.Content),
 			})
 		}
 
